@@ -1,6 +1,11 @@
+import os
+import json
+from pathlib import Path
+from typing import List, Dict, Optional
+
 import streamlit as st
 from dotenv import load_dotenv
-from typing import List, Dict, Optional, Union
+
 from search_movie import (
     search_movie,
     get_movie_details,
@@ -10,16 +15,67 @@ from search_movie import (
     get_top_rated,
 )
 
+# -------------------------------------------------
+# Setup
+# -------------------------------------------------
 load_dotenv()
 
-# rerun helper
+MY_LIST_FILE = Path("my_list.json")
+
+
+def load_my_list_from_disk() -> list:
+    if MY_LIST_FILE.exists():
+        try:
+            return json.loads(MY_LIST_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def save_my_list_to_disk(mylist: list) -> None:
+    try:
+        MY_LIST_FILE.write_text(json.dumps(mylist), encoding="utf-8")
+    except OSError:
+        # If something goes wrong writing to disk, just ignore
+        pass
+
+
+# Helpers to modify `st.session_state.my_list` and persist immediately
+def add_to_my_list(movie_id: int) -> None:
+    if movie_id is None:
+        return
+    if movie_id not in st.session_state.my_list:
+        st.session_state.my_list.append(movie_id)
+        save_my_list_to_disk(st.session_state.my_list)
+
+
+def remove_from_my_list(movie_id: int) -> None:
+    if movie_id is None:
+        return
+    st.session_state.my_list = [mid for mid in st.session_state.my_list if mid != movie_id]
+    save_my_list_to_disk(st.session_state.my_list)
+
+
+
+# Helpful runtime guard: show a clear message if TMDb API key is not configured
+if not os.getenv("TMDB_API_KEY"):
+    st.error(
+        "TMDb API key not found. Please create a `.env` with "
+        "TMDB_API_KEY=your_key and restart the app."
+    )
+    st.stop()
+
+
 def safe_rerun():
     try:
         st.rerun()
     except AttributeError:
         st.experimental_rerun()
 
-# small helpers
+
+# -------------------------------------------------
+# Small helpers
+# -------------------------------------------------
 def get_poster_url(path: Optional[str]) -> str:
     if path:
         return f"https://image.tmdb.org/t/p/w500{path}"
@@ -51,20 +107,22 @@ def truncate(text: Optional[str], n: int = 240) -> str:
 
 
 def render_row_html(row_title: str, movies: List[Dict]) -> str:
-    """
-    Build a Netflix-style row with horizontal scroll.
-    IMPORTANT FIX:
-    - We return a string that STARTS with <section ...> (no leading spaces/newline)
-      so Streamlit doesn't treat it as a code block.
-    """
     cards_html_parts = []
     for m in movies:
+        if (not m.get("poster_path")) and (m.get("vote_average", 0) == 0):
+            continue
+
         poster = get_poster_url(m.get("poster_path"))
         title = m.get("title", "Untitled")
         year = (m.get("release_date") or "")[:4]
         rating = m.get("vote_average", "N/A")
+        movie_id = m.get("id")
+
+        # if movie_id is missing, just don't make it a link
+        href = f"?movie={movie_id}" if movie_id is not None else "#"
 
         card_html = (
+            f'<a class="nm-card-link" href="{href}">'     # <-- NEW
             '<div class="nm-card">'
             '<div class="nm-card-inner">'
             f'<img src="{poster}" class="nm-card-img" alt="{title} poster"/>'
@@ -74,11 +132,11 @@ def render_row_html(row_title: str, movies: List[Dict]) -> str:
             "</div>"
             "</div>"
             "</div>"
+            "</a>"                                        # <-- NEW
         )
         cards_html_parts.append(card_html)
 
     cards_html = "".join(cards_html_parts)
-
     row_html = (
         '<section class="nm-row">'
         f'<div class="nm-row-header">{row_title}</div>'
@@ -88,11 +146,9 @@ def render_row_html(row_title: str, movies: List[Dict]) -> str:
     return row_html
 
 
+
 def render_modal(details: Dict, recs: List[Dict]) -> None:
-    """
-    Show fullscreen overlay for "More Info".
-    Also FIXED: first char of modal_html is '<', not newline.
-    """
+    """Full‐screen modal for 'More Info'."""
     title = details.get("title", "Untitled")
     year = (details.get("release_date") or "N/A")[:4]
     rating = details.get("vote_average", "N/A")
@@ -103,7 +159,6 @@ def render_modal(details: Dict, recs: List[Dict]) -> None:
     overview = details.get("overview", "No description available.")
     poster_big = get_poster_url(details.get("poster_path"))
 
-    # Build recommendations row
     recs_html_block = ""
     if recs:
         recs_html_block = render_row_html("More Like This", recs[:10])
@@ -125,24 +180,80 @@ def render_modal(details: Dict, recs: List[Dict]) -> None:
         "</div>"
     )
 
+    # Top-left back arrow (inside app)
+    st.markdown('<div class="nm-modal-back-top">', unsafe_allow_html=True)
+    if st.button("←", key="back_modal"):
+        # Clear selection in state
+        st.session_state.selected_movie_id = None
+        # Remove ?movie= from the URL so browser Back also works
+        # clear all query params (removes ?movie=...)
+        st.query_params = {}
+        safe_rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Main modal card
     st.markdown(modal_html, unsafe_allow_html=True)
 
-    close_col, _ = st.columns([1, 5])
-    with close_col:
-        if st.button("Close ✕", key="close_modal"):
-            st.session_state.selected_movie_id = None
+    # Add / Remove from My List button, aligned under description
+    st.markdown('<div class="nm-modal-add">', unsafe_allow_html=True)
+    movie_id = details.get("id")
+    in_list = movie_id in st.session_state.my_list if movie_id is not None else False
+    label = "Remove from My List" if in_list else "Add to My List"
+    if st.button(label, key=f"toggle_mylist_{movie_id}"):
+        if movie_id is not None:
+            if in_list:
+                remove_from_my_list(movie_id)
+            else:
+                add_to_my_list(movie_id)
+
             safe_rerun()
 
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.set_page_config(
-    page_title="Netflix Explorer",
-    layout="wide",
-)
+
+# -------------------------------------------------
+# Page & session setup
+# -------------------------------------------------
+st.set_page_config(page_title="Netflix Explorer", layout="wide")
+
+if "my_list" not in st.session_state:
+    st.session_state.my_list = load_my_list_from_disk()
 
 if "selected_movie_id" not in st.session_state:
     st.session_state.selected_movie_id = None
 
+# current page (used for simple routing/views)
+if "page" not in st.session_state:
+    st.session_state.page = "home"
 
+# -------------------------------------------------
+# 🔗 URL <-> state synchronisation
+#    (THIS must be before `if st.session_state.selected_movie_id is not None`)
+# -------------------------------------------------
+qp = st.query_params
+
+# Get movie id from ?movie= in the URL (handles str or list)
+if "movie" in qp:
+    raw_val = qp["movie"]
+    if isinstance(raw_val, list):
+        movie_from_url = raw_val[0] if raw_val else None
+    else:
+        movie_from_url = raw_val
+else:
+    movie_from_url = None
+
+if movie_from_url:
+    try:
+        st.session_state.selected_movie_id = int(movie_from_url)
+    except ValueError:
+        st.session_state.selected_movie_id = None
+else:
+    # No ?movie= in URL → no modal
+    st.session_state.selected_movie_id = None
+
+# -------------------------------------------------
+# Global styles
+# -------------------------------------------------
 st.markdown(
     """
 <style>
@@ -205,14 +316,14 @@ body, .stApp {
     text-shadow: 0 0 10px rgba(255,255,255,0.4);
 }
 
-/* CONTENT WRAPPER (to sit under navbar) */
+/* CONTENT WRAPPER */
 .nm-content {
     padding-top: 64px;
     position: relative;
     z-index: 1;
 }
 
-/* HERO billboard */
+/* HERO */
 .nm-hero {
     position: relative;
     width: 100%;
@@ -301,6 +412,11 @@ body, .stApp {
     border: 1px solid rgba(255,255,255,0.07);
     box-shadow: 0 18px 40px rgba(0,0,0,0.75);
 }
+.nm-card-link {
+    text-decoration: none;
+    color: inherit;
+    display: inline-block;
+}
 .nm-card:hover {
     transform: scale(1.07);
     box-shadow: 0 40px 120px rgba(229,9,20,0.6);
@@ -336,15 +452,13 @@ body, .stApp {
     font-weight: 500;
 }
 
-/* MODAL (More Info overlay) */
+/* MODAL */
 .nm-modal-backdrop {
-    position: fixed;
-    inset: 0;
     background: rgba(0,0,0,0.8);
-    backdrop-filter: blur(4px);
-    z-index: 2000;
-    overflow-y: auto;
-    padding: 5vh 0 10vh 0;
+    border-radius: 12px;
+    margin: 2rem auto;
+    padding: 2rem 1.5rem 2.5rem 1.5rem;
+    max-width: 960px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -359,7 +473,7 @@ body, .stApp {
     box-shadow: 0 60px 160px rgba(0,0,0,1);
     display: flex;
     flex-wrap: wrap;
-    padding: 1.5rem 1.5rem 1rem 1.5rem;
+    padding: 1.5rem 1.5rem 0.5rem 1.5rem;
     color: var(--text-main);
 }
 .nm-modal-left {
@@ -406,7 +520,47 @@ body, .stApp {
     margin-top: 2rem;
 }
 
-/* Search bar (override Streamlit input) */
+/* Back arrow container */
+.nm-modal-back-top {
+    width: min(900px, 90%);
+    margin: 1.2rem auto 0 auto;
+    display: flex;
+    justify-content: flex-start;
+}
+.nm-modal-back-top .stButton {
+    display: inline-flex;
+}
+.nm-modal-back-top .stButton > button {
+    width: 40px;
+    height: 40px;
+    padding: 0 !important;
+    border-radius: 999px !important;
+    background: rgba(0,0,0,0.75) !important;
+    border: 1px solid rgba(255,255,255,0.25) !important;
+    font-size: 1.2rem !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+}
+
+/* Add button under description */
+.nm-modal-add {
+    width: min(900px, 90%);
+    margin: -0.25rem auto 0 auto;
+    padding: 0 1.5rem 1.5rem 1.5rem;
+    display: flex;
+    justify-content: flex-start;
+}
+.nm-modal-add .stButton {
+    margin-left: 230px; /* ≈ poster width (200) + gap (30) */
+}
+.nm-modal-add .stButton > button {
+    background: linear-gradient(135deg, #e50914, #f40612) !important;
+    border-radius: 999px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em;
+}
+
+/* Search bar */
 .stTextInput > div > div > input {
     background-color: #1a1a1a !important;
     color: var(--text-main) !important;
@@ -423,7 +577,7 @@ body, .stApp {
     box-shadow: 0 0 20px rgba(229,9,20,0.7) !important;
 }
 
-/* Streamlit buttons -> Netflix-style CTA */
+/* Global button style */
 .stButton>button {
     background: var(--accent) !important;
     color: #fff !important;
@@ -437,32 +591,62 @@ body, .stApp {
 .stButton>button:hover {
     box-shadow: 0 30px 80px rgba(229,9,20,0.8) !important;
 }
+.nm-link {
+    padding: 0 0.75rem;
+    color: #e6e6e6;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.2s ease, border-color 0.2s ease;
+    border-bottom: 2px solid transparent;
+}
+
+.nm-link:hover {
+    color: #ffffff;
+}
+
+.nm-link-active {
+    color: #ffffff;
+    font-weight: 600;
+    border-bottom-color: #E50914;
+}
+
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+# -------------------------------------------------
+# Top nav + main content wrapper
+# -------------------------------------------------
+# Dynamic navbar (highlights active page)
+current_page = st.session_state.page  # "home" or "my_list"
 
-st.markdown(
-    '<div class="nm-nav">'
-    '<div class="nm-logo">NETFLIX</div>'
-    '<div class="nm-links">'
-    "<div>Home</div>"
-    "<div>TV Shows</div>"
-    "<div>Movies</div>"
-    "<div>My List</div>"
-    "</div>"
-    "</div>",
-    unsafe_allow_html=True,
-)
+nav_html = f"""
+<div class="nm-nav">
+  <div class="nm-logo">NETFLIX</div>
+  <div class="nm-links">
+    <span class="nm-link {'nm-link-active' if current_page == 'home' else ''}">
+        Home
+    </span>
+    <span class="nm-link {'nm-link-active' if current_page == 'my_list' else ''}">
+        My List
+    </span>
+  </div>
+</div>
+"""
 
-
+st.markdown(nav_html, unsafe_allow_html=True)
 
 st.markdown('<div class="nm-content">', unsafe_allow_html=True)
 
-search_query = st.text_input("🔍 Search for a movie", value="", key="search_box")
+# -------------------------------------------------
+# Search + fetch lists
+# -------------------------------------------------
+search_query = st.text_input("Search for a movie", value="", key="search_box")
+is_searching = bool(search_query.strip())
 
-if search_query.strip():
+if is_searching:
     search_results = search_movie(search_query.strip())
 else:
     search_results = []
@@ -471,16 +655,114 @@ trending_list = get_trending()
 popular_list = get_popular()
 top_rated_list = get_top_rated()
 
+# -------------------------------------------------
+# If a movie is selected, show modal and stop drawing the rest
+# (URL sync above ensures browser Back updates this)
+# -------------------------------------------------
+if st.session_state.selected_movie_id is not None:
+    movie_id = st.session_state.selected_movie_id
+    details = get_movie_details(movie_id)
+    recs = get_recommendations(movie_id)
 
+    if details:
+        render_modal(details, recs)
+        st.markdown("</div>", unsafe_allow_html=True)  # close nm-content
+        st.stop()
+    else:
+        st.session_state.selected_movie_id = None
+
+# -------------------------------------------------
+# Main page (no modal open)
+# -------------------------------------------------
 hero_movie = None
-if trending_list:
-    hero_movie = trending_list[0]
-elif popular_list:
-    hero_movie = popular_list[0]
-elif search_results:
-    hero_movie = search_results[0]
+if is_searching:
+    if search_results:
+        hero_movie = search_results[0]
+else:
+    if trending_list:
+        hero_movie = trending_list[0]
+    elif popular_list:
+        hero_movie = popular_list[0]
+    elif top_rated_list:
+        hero_movie = top_rated_list[0]
 
+if is_searching and not search_results:
+    st.info("No results found.")
 
+if is_searching and search_results:
+    st.markdown(
+        render_row_html("Search Results", search_results[:12]),
+        unsafe_allow_html=True,
+    )
+    for m in search_results[:12]:
+        if st.button(
+            f"More Info on {m.get('title', 'Untitled')} ▶",
+            key=f"open-{m['id']}",
+        ):
+            mid = m["id"]
+            st.session_state.selected_movie_id = mid
+            st.query_params = {"movie": str(mid)}
+            safe_rerun()
+
+# Show "My List" row when not searching
+if (not is_searching) and st.session_state.my_list:
+    saved_movies = []
+    for mid in st.session_state.my_list:
+        data = get_movie_details(mid)
+        if data:
+            saved_movies.append(data)
+    if saved_movies:
+        st.markdown(
+            render_row_html("My List", saved_movies),
+            unsafe_allow_html=True,
+        )
+        # Add Remove buttons beneath each poster so users can remove items directly from My List
+        # Layout uses 6 columns to match the poster grid width
+        remove_cols = st.columns(6)
+        for i, m in enumerate(saved_movies):
+            mid = m.get("id")
+            if mid is None:
+                continue
+            with remove_cols[i % 6]:
+                if st.button("Remove", key=f"remove-{mid}"):
+                    # Remove and persist immediately, then rerun to refresh UI
+                    remove_from_my_list(mid)
+                    safe_rerun()
+
+# (URL -> state sync earlier handles modal display when ?movie= is present)
+
+# ----------------- PAGE ROUTING -----------------
+if st.session_state.page == "my_list":
+    # 3a. render My List page
+    if not st.session_state.my_list:
+        st.subheader("My List")
+        st.write("You haven't added any movies yet.")
+    else:
+        # fetch details for each saved movie
+        saved_movies = []
+        for mid in st.session_state.my_list:
+            data = get_movie_details(mid)
+            if data:
+                saved_movies.append(data)
+
+        st.subheader("My List")
+        st.markdown(
+            render_row_html("Saved movies", saved_movies),
+            unsafe_allow_html=True,
+        )
+
+        # optional: show remove buttons
+        for m in saved_movies:
+            if st.button(f"Remove {m.get('title','Untitled')}", key=f"remove_{m['id']}"):
+                st.session_state.my_list = [
+                    x for x in st.session_state.my_list if x != m["id"]
+                ]
+                save_my_list_to_disk(st.session_state.my_list)
+                safe_rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+# Hero section
 if hero_movie:
     hero_backdrop = get_backdrop_url(hero_movie)
     hero_title = hero_movie.get("title", "Untitled")
@@ -502,16 +784,17 @@ if hero_movie:
 
     moreinfo_col, _ = st.columns([1, 5])
     with moreinfo_col:
-        if st.button(f"More Info on {hero_title} ▶", key="hero_moreinfo"):
-            st.session_state.selected_movie_id = hero_movie.get("id")
-            safe_rerun()
+        if st.button(
+            f"More Info on {hero_title} ▶",
+            key="hero_moreinfo",
+        ):
+            mid = hero_movie.get("id")
+            if mid is not None:
+                st.session_state.selected_movie_id = mid
+                st.query_params = {"movie": str(mid)}
+                safe_rerun()
 
-if search_results:
-    st.markdown(
-        render_row_html("Search Results", search_results[:12]),
-        unsafe_allow_html=True,
-    )
-
+# Recommendations based on hero
 if hero_movie:
     recs_for_hero = get_recommendations(hero_movie.get("id"))
     if recs_for_hero:
@@ -523,32 +806,22 @@ if hero_movie:
             unsafe_allow_html=True,
         )
 
-if trending_list:
-    st.markdown(
-        render_row_html("Trending Now", trending_list[:12]),
-        unsafe_allow_html=True,
-    )
+# Default rows when not searching
+if not is_searching:
+    if trending_list:
+        st.markdown(
+            render_row_html("Trending Now", trending_list[:12]),
+            unsafe_allow_html=True,
+        )
+    if popular_list:
+        st.markdown(
+            render_row_html("Popular on Netflix", popular_list[:12]),
+            unsafe_allow_html=True,
+        )
+    if top_rated_list:
+        st.markdown(
+            render_row_html("Top Rated", top_rated_list[:12]),
+            unsafe_allow_html=True,
+        )
 
-if popular_list:
-    st.markdown(
-        render_row_html("Popular on Netflix", popular_list[:12]),
-        unsafe_allow_html=True,
-    )
-
-if top_rated_list:
-    st.markdown(
-        render_row_html("Top Rated", top_rated_list[:12]),
-        unsafe_allow_html=True,
-    )
-
-st.markdown("</div>", unsafe_allow_html=True)  
-
-if st.session_state.selected_movie_id is not None:
-    movie_id = st.session_state.selected_movie_id
-    details = get_movie_details(movie_id)
-    recs = get_recommendations(movie_id)
-
-    if details:
-        render_modal(details, recs)
-    else:
-        st.session_state.selected_movie_id = None
+st.markdown("</div>", unsafe_allow_html=True)
